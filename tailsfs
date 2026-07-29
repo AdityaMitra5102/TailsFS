@@ -1,0 +1,644 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import json
+import errno
+import signal
+import time
+import threading
+from pathlib import Path
+from getpass import getpass
+
+import pyfuse3
+import pyfuse3.asyncio
+import asyncio
+
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.backends import default_backend
+from fido2.hid import CtapHidDevice
+from fido2.client import Fido2Client, DefaultClientDataCollector, UserInteraction
+from fido2.ctap import CtapError
+from fido2.ctap2.extensions import HmacSecretExtension
+from fido2.server import Fido2Server
+from usbmonitor import USBMonitor
+
+from plyer import notification
+
+
+try:
+    from fido2.pcsc import CtapPcscDevice
+except ImportError:
+    CtapPcscDevice = None
+
+
+class CliInteraction(UserInteraction):
+    def __init__(self):
+        self._pin = None
+
+    def prompt_up(self):
+        print("\nTouch your authenticator device now...\n")
+        try:
+            notification.notify(title="🎯 TailsFS", message="🎯 Tap your authenticator!", app_name="TailsFS", timeout=5)
+        except:
+            pass
+
+
+    def request_pin(self, permissions, rd_id):
+        if not self._pin:
+            self._pin = getpass("Enter PIN: ")
+        return self._pin
+
+    def request_uv(self, permissions, rd_id):
+        print("User Verification required.")
+        return True
+
+
+def enumerate_devices():
+    for dev in CtapHidDevice.list_devices():
+        yield dev
+    if CtapPcscDevice:
+        for dev in CtapPcscDevice.list_devices():
+            yield dev
+
+
+cryptokey = bytes(32)
+cryptokey_lock = threading.RLock()
+
+inode_counter = 1
+inode_map = {"": pyfuse3.ROOT_INODE}
+inode_reverse = {pyfuse3.ROOT_INODE: ""}
+inode_lock = threading.Lock()
+
+
+def get_inode(path_str):
+    global inode_counter, inode_map, inode_reverse
+
+    path_str = str(path_str).lstrip("/")
+    if path_str in (".", ""):
+        return pyfuse3.ROOT_INODE
+
+    with inode_lock:
+        if path_str not in inode_map:
+            inode_counter += 1
+            inode_map[path_str] = inode_counter
+            inode_reverse[inode_counter] = path_str
+        return inode_map[path_str]
+
+
+def get_path_from_inode(inode):
+    global inode_reverse
+    with inode_lock:
+        return inode_reverse.get(inode, "")
+
+
+class TailsFS(pyfuse3.Operations):
+    def __init__(self, config_file):
+        super().__init__()
+        self.config = self._load_config(config_file)
+        self.backend_path = Path.home() / ".tailsfs" / "data"
+        self.backend_path.mkdir(parents=True, exist_ok=True)
+
+        self.fido2_client = None
+        self.fido2_server = None
+
+    def _load_config(self, config_file):
+        with open(config_file, "r") as f:
+            return json.load(f)
+
+    def _init_fido2_client(self):
+        target_vid = int(self.config["vid"], 16)
+        target_pid = int(self.config["pid"], 16)
+
+        device = None
+        for dev in enumerate_devices():
+            if dev.descriptor.vid == target_vid and dev.descriptor.pid == target_pid:
+                device = dev
+                break
+
+        if not device:
+            raise RuntimeError(
+                f"Matching FIDO2 device not found (VID:{target_vid:04x}, PID:{target_pid:04x})"
+            )
+
+        self.fido2_client = Fido2Client(
+            device,
+            client_data_collector=DefaultClientDataCollector("https://localhost"),
+            user_interaction=CliInteraction(),
+            extensions=[HmacSecretExtension(allow_hmac_secret=True)],
+        )
+        self.fido2_server = Fido2Server({"id": "localhost", "name": "TailsFS"})
+
+    def _derive_crypto_key(self):
+        """Derive AES-256-CTR key from FIDO2 HMAC-Secret."""
+        global cryptokey, cryptokey_lock
+
+        if self.fido2_client is None:
+            self._init_fido2_client()
+
+        print("[*] Deriving cryptokey from FIDO2 credential...")
+
+        cred_id = bytes.fromhex(self.config["cred_id"])
+        salt = bytes.fromhex(self.config["salt"])
+
+        auth_data, state = self.fido2_server.authenticate_begin(
+            [{"type": "public-key", "id": cred_id}],
+            user_verification="discouraged"
+        )
+
+        try:
+            print("[*] Confirming on security key for HMAC-Secret...")
+            result = self.fido2_client.get_assertion(
+                {
+                    **auth_data["publicKey"],
+                    "extensions": {"hmacGetSecret": {"salt1": salt}},
+                }
+            )
+        except CtapError as ce:
+            if ce.code == CtapError.ERR.NO_CREDENTIALS:
+                print("[!] Configured credential ID was not found on the plugged security key.")
+            else:
+                print(f"[!] FIDO2 device error: {ce}")
+            raise
+        except Exception as e:
+            print(f"[!] FIDO2 assertion failed: {e}")
+            raise
+
+        response = result.get_response(0)
+
+        try:
+            hmac_secret = response.client_extension_results.hmac_get_secret.output1
+        except Exception as e:
+            print(f"[!] Failed to extract HMAC-Secret: {e}")
+            raise RuntimeError("HMAC-Secret not returned by device")
+
+        print("[+] Got HMAC-Secret, deriving key...")
+
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt.encode() if isinstance(salt, str) else salt,
+            info=b"tailsfs-aes256-ctr-v1",
+            backend=default_backend()
+        )
+        derived_key = hkdf.derive(hmac_secret)
+
+        with cryptokey_lock:
+            cryptokey = derived_key
+
+        print("[+] Cryptokey derived successfully")
+        return derived_key
+
+    async def get_cryptokey(self):
+        global cryptokey, cryptokey_lock
+
+        with cryptokey_lock:
+            if cryptokey != bytes(32):
+                return cryptokey
+
+        try:
+            key = await asyncio.get_event_loop().run_in_executor(
+                None, self._derive_crypto_key
+            )
+            return key
+        except Exception as e:
+            print(f"[!] Key derivation failed: {e}")
+            raise pyfuse3.FUSEError(errno.ENODEV)
+
+    def _get_iv_from_path(self, path):
+        """Get IV from xattr or derive deterministic fallback IV from file metadata."""
+        try:
+            iv = os.getxattr(str(path), b"user.tailsfs.iv")
+            if len(iv) == 16:
+                return iv
+        except (OSError, AttributeError):
+            pass
+
+        # Fallback: create IV from xattr or store deterministic IV if xattr fails
+        iv = os.urandom(16)
+        try:
+            os.setxattr(str(path), b"user.tailsfs.iv", iv)
+        except (OSError, AttributeError):
+            st = os.lstat(path)
+            h = hashes.Hash(hashes.SHA256(), backend=default_backend())
+            h.update(str(path).encode() + str(st.st_mtime_ns).encode())
+            iv = h.finalize()[:16]
+        return iv
+
+    def _compute_ctr_iv(self, base_iv: bytes, offset: int) -> bytes:
+        block_index = offset // 16
+        iv_int = int.from_bytes(base_iv, byteorder="big")
+        counter_int = (iv_int + block_index) & ((1 << 128) - 1)
+        return counter_int.to_bytes(16, byteorder="big")
+
+    def _encrypt_data(self, data: bytes, iv: bytes, offset: int = 0) -> bytes:
+        global cryptokey, cryptokey_lock
+        with cryptokey_lock:
+            key = cryptokey
+
+        if key == bytes(32):
+            raise pyfuse3.FUSEError(errno.ENODEV)
+
+        if not data:
+            return b""
+
+        align_start = offset % 16
+        effective_offset = offset - align_start
+        effective_iv = self._compute_ctr_iv(iv, effective_offset)
+
+        total_len = align_start + len(data)
+        align_end = (16 - (total_len % 16)) % 16
+        padded_data = (b"\x00" * align_start) + data + (b"\x00" * align_end)
+
+        cipher = Cipher(algorithms.AES(key), modes.CTR(effective_iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        encrypted = encryptor.update(padded_data) + encryptor.finalize()
+
+        return encrypted[align_start : align_start + len(data)]
+
+    def _decrypt_data(self, ciphertext: bytes, iv: bytes, offset: int = 0) -> bytes:
+        global cryptokey, cryptokey_lock
+        with cryptokey_lock:
+            key = cryptokey
+
+        if key == bytes(32):
+            raise pyfuse3.FUSEError(errno.ENODEV)
+
+        if not ciphertext:
+            return b""
+
+        align_start = offset % 16
+        effective_offset = offset - align_start
+        effective_iv = self._compute_ctr_iv(iv, effective_offset)
+
+        total_len = align_start + len(ciphertext)
+        align_end = (16 - (total_len % 16)) % 16
+        padded_ciphertext = (b"\x00" * align_start) + ciphertext + (b"\x00" * align_end)
+
+        cipher = Cipher(algorithms.AES(key), modes.CTR(effective_iv), backend=default_backend())
+        decryptor = cipher.decryptor()
+        decrypted = decryptor.update(padded_ciphertext) + decryptor.finalize()
+
+        return decrypted[align_start : align_start + len(ciphertext)]
+
+    async def open(self, inode, flags, ctx):
+        fi = pyfuse3.FileInfo(fh=inode)
+        fi.direct_io = False
+        fi.keep_cache = True
+        return fi
+
+    async def release(self, fh):
+        pass
+
+    async def read(self, fh, offset, size):
+        await self.get_cryptokey()
+
+        path = self._resolve_inode_path(fh)
+        if not path.exists() or not path.is_file():
+            raise pyfuse3.FUSEError(errno.ENOENT)
+
+        loop = asyncio.get_running_loop()
+
+        def _sync_read():
+            iv = self._get_iv_from_path(path)
+            with open(path, "rb") as f:
+                f.seek(offset)
+                ciphertext = f.read(size)
+            return self._decrypt_data(ciphertext, iv, offset=offset)
+
+        return await loop.run_in_executor(None, _sync_read)
+
+    async def write(self, fh, offset, data):
+        await self.get_cryptokey()
+
+        path = self._resolve_inode_path(fh)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        loop = asyncio.get_running_loop()
+
+        def _sync_write():
+            iv = self._get_iv_from_path(path)
+            ciphertext = self._encrypt_data(data, iv, offset=offset)
+            mode = "r+b" if path.exists() else "wb"
+            with open(path, mode) as f:
+                f.seek(offset)
+                f.write(ciphertext)
+            return len(data)
+
+        return await loop.run_in_executor(None, _sync_write)
+
+    def _resolve_inode_path(self, inode):
+        rel_path = get_path_from_inode(inode)
+        return self.backend_path / rel_path if rel_path else self.backend_path
+
+    async def lookup(self, parent_inode, name, ctx=None):
+        parent_path = self._resolve_inode_path(parent_inode)
+        name_str = name.decode() if isinstance(name, bytes) else name
+        child_path = parent_path / name_str
+
+        if not child_path.exists():
+            raise pyfuse3.FUSEError(errno.ENOENT)
+
+        rel_path = child_path.relative_to(self.backend_path)
+        inode = get_inode(rel_path)
+        return await self.getattr(inode, ctx)
+
+    async def getattr(self, inode, ctx=None):
+        path = self._resolve_inode_path(inode)
+
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+
+        entry = pyfuse3.EntryAttributes()
+        entry.st_ino = inode
+        entry.generation = 1
+        entry.entry_timeout = 1.0
+        entry.attr_timeout = 1.0
+        entry.st_mode = st.st_mode
+        entry.st_nlink = st.st_nlink
+        entry.st_uid = st.st_uid
+        entry.st_gid = st.st_gid
+        entry.st_rdev = st.st_rdev
+        entry.st_size = st.st_size
+        entry.st_blksize = 512
+        entry.st_blocks = (st.st_size + 511) // 512
+        entry.st_atime_ns = int(st.st_atime * 1e9)
+        entry.st_mtime_ns = int(st.st_mtime * 1e9)
+        entry.st_ctime_ns = int(st.st_ctime * 1e9)
+
+        return entry
+
+    async def setattr(self, inode, attr, fields, fh, ctx):
+        path = self._resolve_inode_path(inode)
+
+        if fields.update_size:
+            with open(path, "a+b") as f:
+                f.truncate(attr.st_size)
+
+        if fields.update_mode:
+            os.chmod(path, attr.st_mode)
+
+        if fields.update_uid or fields.update_gid:
+            os.chown(path, attr.st_uid if fields.update_uid else -1,
+                           attr.st_gid if fields.update_gid else -1)
+
+        return await self.getattr(inode, ctx)
+
+    def _update_inode_mapping(self, old_rel_path: str, new_rel_path: str):
+        global inode_map, inode_reverse, inode_lock
+        with inode_lock:
+            if old_rel_path in inode_map:
+                inode = inode_map.pop(old_rel_path)
+                inode_map[new_rel_path] = inode
+                inode_reverse[inode] = new_rel_path
+
+            old_prefix = old_rel_path + "/"
+            new_prefix = new_rel_path + "/"
+            to_update = [k for k in inode_map.keys() if k.startswith(old_prefix)]
+
+            for k in to_update:
+                inode = inode_map.pop(k)
+                child_rel = new_prefix + k[len(old_prefix):]
+                inode_map[child_rel] = inode
+                inode_reverse[inode] = child_rel
+
+    async def rename(self, parent_inode_old, name_old, parent_inode_new, name_new, flags, ctx):
+        parent_path_old = self._resolve_inode_path(parent_inode_old)
+        name_old_str = name_old.decode() if isinstance(name_old, bytes) else name_old
+        old_path = parent_path_old / name_old_str
+
+        parent_path_new = self._resolve_inode_path(parent_inode_new)
+        name_new_str = name_new.decode() if isinstance(name_new, bytes) else name_new
+        new_path = parent_path_new / name_new_str
+
+        if not old_path.exists():
+            raise pyfuse3.FUSEError(errno.ENOENT)
+
+        loop = asyncio.get_running_loop()
+
+        def _sync_rename():
+            os.rename(old_path, new_path)
+
+        await loop.run_in_executor(None, _sync_rename)
+
+        old_rel = str(old_path.relative_to(self.backend_path))
+        new_rel = str(new_path.relative_to(self.backend_path))
+        self._update_inode_mapping(old_rel, new_rel)
+
+    async def mkdir(self, parent_inode, name, mode, ctx):
+        parent_path = self._resolve_inode_path(parent_inode)
+        name_str = name.decode() if isinstance(name, bytes) else name
+        new_path = parent_path / name_str
+
+        os.mkdir(new_path, mode)
+        rel_path = new_path.relative_to(self.backend_path)
+        inode = get_inode(rel_path)
+        return await self.getattr(inode)
+
+    async def create(self, parent_inode, name, mode, flags, ctx):
+        parent_path = self._resolve_inode_path(parent_inode)
+        name_str = name.decode() if isinstance(name, bytes) else name
+        new_path = parent_path / name_str
+
+        parent_path.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(new_path), flags | os.O_CREAT, mode)
+        os.close(fd)
+
+        rel_path = new_path.relative_to(self.backend_path)
+        inode = get_inode(rel_path)
+
+        fi = pyfuse3.FileInfo(fh=inode)
+        fi.direct_io = False
+        return (fi, await self.getattr(inode))
+
+    async def unlink(self, parent_inode, name, ctx):
+        parent_path = self._resolve_inode_path(parent_inode)
+        name_str = name.decode() if isinstance(name, bytes) else name
+        file_path = parent_path / name_str
+        os.unlink(file_path)
+
+    async def rmdir(self, parent_inode, name, ctx):
+        parent_path = self._resolve_inode_path(parent_inode)
+        name_str = name.decode() if isinstance(name, bytes) else name
+        dir_path = parent_path / name_str
+        os.rmdir(dir_path)
+
+    async def opendir(self, inode, ctx):
+        return inode
+
+    async def readdir(self, fh, start_id, token):
+        path = self._resolve_inode_path(fh)
+
+        if not path.is_dir():
+            raise pyfuse3.FUSEError(errno.ENOTDIR)
+
+        entries = list(path.iterdir())
+
+        for i, entry in enumerate(entries[start_id:], start=start_id + 1):
+            rel_path = entry.relative_to(self.backend_path)
+            inode = get_inode(rel_path)
+            attr = await self.getattr(inode)
+
+            if not pyfuse3.readdir_reply(
+                token,
+                entry.name.encode(),
+                attr,
+                i
+            ):
+                break
+
+
+def setup_usb_monitor(config, stop_event, loop):
+    target_vid = config["vid"].lower().zfill(4)
+    target_pid = config["pid"].lower().zfill(4)
+
+    filter_spec = ({'ID_VENDOR_ID': target_vid, 'ID_MODEL_ID': target_pid},)
+    monitor = USBMonitor(filter_devices=filter_spec)
+
+    def on_connect(device_id, device_info):
+        print("[+] FIDO2 device connected")
+
+    def trigger_disconnect():
+        global cryptokey, cryptokey_lock
+        print("[!] Device disconnected - resetting cryptokey & stopping mount session")
+        with cryptokey_lock:
+            cryptokey = bytes(32)
+
+        try:
+            pyfuse3.close()
+            notification.notify(title="🔌 TailsFS", message="🔌 Authenticator removed!", app_name="TailsFS", timeout=5)
+        except Exception:
+            pass
+        stop_event.set()
+
+    def on_disconnect(device_id, device_info):
+        loop.call_soon_threadsafe(trigger_disconnect)
+
+    monitor.start_monitoring(
+        on_connect=on_connect,
+        on_disconnect=on_disconnect
+    )
+    return monitor
+
+
+async def run_mount_session(config, config_file):
+    global inode_counter, inode_map, inode_reverse
+
+    with inode_lock:
+        inode_counter = 1
+        inode_map = {"": pyfuse3.ROOT_INODE}
+        inode_reverse = {pyfuse3.ROOT_INODE: ""}
+
+    mount_path = Path(config["mount_path"])
+
+    try:
+        os.system(f"fusermount -u -z {str(mount_path)}")
+    except Exception as e:
+        print(e)
+
+    try:
+        os.system(f"rm -rf {str(mount_path)}")
+    except Exception as e:
+        print(e)
+
+    mount_path.mkdir(parents=True, exist_ok=True)
+    fs = TailsFS(config_file)
+
+    print()
+    print("╔════════════════════════════════════════════╗")
+    print("║     TailsFS Mounted                        ║")
+    print("║     FIDO2 HMAC-Secret Encrypted            ║")
+    print("╚════════════════════════════════════════════╝\n")
+    print(f"[+] Mounting at: {mount_path}")
+    print(f"[+] Backend: {fs.backend_path}")
+    print(f"[!] Key will be derived on first access")
+    print(f"[!] Press Ctrl+C to unmount\n")
+
+    pyfuse3.asyncio.enable()
+    options = set(pyfuse3.default_options)
+    pyfuse3.init(fs, str(mount_path), options)
+
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.create_task(pyfuse3.main())
+
+    stop_event = asyncio.Event()
+    monitor = setup_usb_monitor(config, stop_event, loop)
+
+    def on_signal():
+        print("\n[*] Shutdown signal received. Stopping pyfuse3...")
+        try:
+            pyfuse3.close()
+        except Exception:
+            pass
+        stop_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, on_signal)
+        except NotImplementedError:
+            pass
+
+    await stop_event.wait()
+
+    try:
+        await asyncio.wait_for(main_task, timeout=2.0)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        pass
+
+    print("[*] Unmounting directory and stopping USB monitor...")
+    try:
+        monitor.stop_monitoring()
+    except Exception:
+        pass
+
+    import subprocess
+    subprocess.run(["fusermount", "-u", "-z", str(mount_path)], check=False)
+
+
+def wait_for_device(config):
+    target_vid = config["vid"].lower().zfill(4)
+    target_pid = config["pid"].lower().zfill(4)
+    filter_spec = ({'ID_VENDOR_ID': target_vid, 'ID_MODEL_ID': target_pid},)
+
+    temp_monitor = USBMonitor(filter_devices=filter_spec)
+    if not temp_monitor.get_available_devices():
+        print("[!] Target FIDO2 USB device not connected. Waiting for insertion...")
+        device_inserted = threading.Event()
+
+        def on_conn(dev_id, info):
+            device_inserted.set()
+
+        temp_monitor.start_monitoring(on_connect=on_conn)
+        device_inserted.wait()
+        try:
+            temp_monitor.stop_monitoring()
+        except Exception:
+            pass
+
+
+def main():
+    config_file = Path.home() / ".config" / "TailsFS.conf"
+    if not config_file.exists():
+        print("[!] Configuration not found. Run 'python3 register.py' first.")
+        sys.exit(1)
+
+    with open(config_file, "r") as f:
+        config = json.load(f)
+
+    while True:
+        try:
+            # wait_for_device(config)
+            asyncio.run(run_mount_session(config, config_file))
+            print("[*] Mount session cleanly closed. Waiting for next device connection...\n")
+            time.sleep(0.5)
+        except (KeyboardInterrupt, SystemExit):
+            print("\n[*] Exiting TailsFS.")
+            break
+
+
+if __name__ == "__main__":
+    main()

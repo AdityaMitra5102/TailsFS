@@ -1,0 +1,5 @@
+cryptography
+fido2
+plyer
+pyfuse3
+usbmonitor

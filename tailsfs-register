@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+
+import os
+import json
+import secrets
+from pathlib import Path
+from getpass import getpass
+
+from fido2.hid import CtapHidDevice
+from fido2.client import Fido2Client, DefaultClientDataCollector, UserInteraction
+from fido2.ctap2.extensions import HmacSecretExtension
+from fido2.server import Fido2Server
+
+try:
+    from fido2.pcsc import CtapPcscDevice
+except ImportError:
+    CtapPcscDevice = None
+
+
+class CliInteraction(UserInteraction):
+    """CLI-based user interaction handler."""
+    def __init__(self):
+        self._pin = None
+
+    def prompt_up(self):
+        print("\nTouch your authenticator device now...\n")
+
+    def request_pin(self, permissions, rd_id):
+        if not self._pin:
+            self._pin = getpass("Enter PIN: ")
+        return self._pin
+
+    def request_uv(self, permissions, rd_id):
+        print("User Verification required.")
+        return True
+
+
+def enumerate_devices():
+    for dev in CtapHidDevice.list_devices():
+        yield dev
+    if CtapPcscDevice:
+        for dev in CtapPcscDevice.list_devices():
+            yield dev
+
+
+def register_fido2_credential():
+    print("[*] Searching for FIDO2 devices...\n")
+
+    device = None
+    client = None
+
+    for dev in enumerate_devices():
+        try:
+            test_client = Fido2Client(
+                dev,
+                client_data_collector=DefaultClientDataCollector("https://localhost"),
+                user_interaction=CliInteraction(),
+                extensions=[HmacSecretExtension(allow_hmac_secret=True)],
+            )
+
+            if "hmac-secret" in test_client.info.extensions:
+                device = dev
+                client = test_client
+                print(f"[+] Found device with HMAC-Secret support: {dev.descriptor.product_name}\n")
+                break
+        except Exception as e:
+            print(f"[!] Error checking device: {e}")
+            continue
+
+    if not device or not client:
+        print("[!] No FIDO2 device with HMAC-Secret support found.")
+        return None
+
+    server = Fido2Server({"id": "localhost", "name": "TailsFS"})
+
+    user = {"id": b"user", "name": "tailsfs-user", "displayName": "TailsFS User"}
+    reg_data, state = server.register_begin(
+        user,
+        user_verification="discouraged"
+    )
+
+    print("\n[*] Perform registration ceremony on your security key...")
+
+    try:
+        result = client.make_credential(
+            {
+                **reg_data["publicKey"],
+                "extensions": {"hmacCreateSecret": True},
+            }
+        )
+    except Exception as e:
+        print(f"[!] Registration failed: {e}")
+        return None
+
+    try:
+        credential = server.register_complete(state, result)
+    except Exception as e:
+        print(f"[!] Registration verification failed: {e}")
+        return None
+
+    print("\n[+] Registration successful!")
+    print(f"[+] Credential ID: {credential.credential_data.credential_id.hex()[:32]}...")
+
+    if result.client_extension_results.get("hmacCreateSecret"):
+        print("[+] HMAC-Secret extension confirmed on device")
+    else:
+        print("[!] Warning: HMAC-Secret may not be available")
+
+    print(device.descriptor)
+
+    return {
+
+        "cred_id": credential.credential_data.credential_id.hex(),
+        "vid": f"{device.descriptor.vid:04x}",
+        "pid": f"{device.descriptor.pid:04x}",
+        "device_name": device.descriptor.product_name,
+    }
+
+
+def get_mount_path():
+    while True:
+        path = input("\n[?] Mount path (e.g., /mnt/secure or ./secure): ").strip()
+        if not path:
+            print("    [!] Path cannot be empty")
+            continue
+        path_obj = Path(path).expanduser().resolve()
+        
+        if path_obj.exists() and not path_obj.is_dir():
+            print("    [!] Path exists but is not a directory")
+            continue
+        return str(path_obj)
+
+def save_config(cred_data, mount_path):
+    config_dir = Path.home() / ".config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+
+    config_file = config_dir / "TailsFS.conf"
+
+    salt = secrets.token_hex(32)
+    config = {
+        "version": "1.0",
+        "cred_id": cred_data["cred_id"],
+        "vid": cred_data["vid"],
+        "pid": cred_data["pid"],
+        "device_name": cred_data["device_name"],
+        "mount_path": mount_path,
+        "salt": salt,
+    }
+    with open(config_file, "w") as f:
+        json.dump(config, f, indent=2)
+
+    os.chmod(config_file, 0o600)
+
+    print(f"\n[+] Configuration saved to {config_file}")
+    print(f"    Mount path: {mount_path}")
+    print(f"    Salt: {salt[:16]}...")
+    print(f"\n[!] IMPORTANT: Keep your security key paired with this device.")
+    print(f"    Filesystem becomes inaccessible if key is unplugged.")
+
+
+def main():
+    print("╔════════════════════════════════════════════╗")
+    print("║     TailsFS Registration                   ║")
+    print("║     FIDO2-backed Encrypted Filesystem      ║")
+    print("╚════════════════════════════════════════════╝\n")
+
+    # Register credential
+    cred_data = register_fido2_credential()
+    if not cred_data:
+        print("[!] Registration failed. Exiting.")
+        return
+
+    # Get mount path
+    mount_path = get_mount_path()
+
+    # Save config
+    save_config(cred_data, mount_path)
+
+    os.system("systemctl --user --force restart tailsfs.service")
+    print("\n[+] Registration complete!")
+    
+
+
+if __name__ == "__main__":
+    main()
