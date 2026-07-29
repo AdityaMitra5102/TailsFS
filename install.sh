@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-set -e
 
 echo "[-] Removing existing installation. This will remove all encrypted files..."
 rm -rf ~/.config/TailsFS.conf
