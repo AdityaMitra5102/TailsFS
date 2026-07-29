@@ -1,3 +1,4 @@
+rm -rf TailsFS
 git clone https://github.com/AdityaMitra5102/TailsFS.git
 
 cd TailsFS 
