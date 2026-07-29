@@ -7,3 +7,5 @@ cd ..
 rm -rf TailsFS
 
 echo "[+] Installation complete"
+
+echo "[!] Run tailsfs-register with your CTAP 2.3 Security key connected"
