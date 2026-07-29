@@ -41,6 +41,6 @@ mkdir -p ~/.config/systemd/user/
 cp tailsfs.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 
-tailsfs-register
+#tailsfs-register
 
 systemctl --user enable --now tailsfs.service
